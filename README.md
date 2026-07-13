@@ -1,116 +1,90 @@
-# Tracing C Agent
+# High-Performance Tracing C Agent
 
-A native JVM agent written in C that prints method signatures with full parameter and return type information for executed methods using the JVMTI (Java Virtual Machine Tool Interface).
+Высокопроизводительный нативный JVM-агент на Си, который логирует сигнатуры методов (включая имена классов, методов и дескрипторы типов) в момент их первого вызова, используя JVMTI (Java Virtual Machine Tool Interface).
 
-## Features
+## Особенности архитектуры
 
-- Prints full method signatures: `Lpackage/Class;.method(Ljava/lang/String;I)Ljava/lang/Object;`
-- Controlled tracing via `AgentCommand.startTrace()` / `AgentCommand.endTrace()`
-- Configurable package filtering via whitelist/blacklist to exclude noise (JDK internals, etc.)
-- Native shared library (`.jnilib` on macOS, `.so` on Linux)
-- Supports both static attach (`-agentpath`) and dynamic attach (`jcmd`)
+- **Lock-Free Reader (C11 Atomics):** Проверка кэша на «быстром пути» (быственном возврате) работает со скоростью чтения процессора без использования мьютексов благодаря атомарным инструкциям C11 (`memory_order_acquire` / `memory_order_release`).
+- **Цепочки коллизий (Chaining):** Разрешение коллизий хэш-таблицы через динамические цепочки указателей гарантирует 100% стабильность под многопоточной нагрузкой без риска потери вывода или взаимных блокировок (дедлоков).
+- **Защита от рекурсии JVMTI:** Агент временно отключает уведомления для текущего потока во время работы на «медленном пути», предотвращая дедлоки при вызове `fprintf`/`malloc`.
+- **Автоматическая диагностика:** При завершении процесса JVM агент перехватывает событие `VMDeath` и выводит подробную статистику эффективности кэша (Load Factor, коллизии, уникальные методы) в `stderr`.
+- **Zero Memory Overhead для строк:** Строки логов выводятся в `stdout` на медленном пути ровно один раз и не удерживаются в оперативной памяти. Узел кэша занимает всего 16 байт.
 
-## Building
+## Структура проекта
+
+```text
+tracing-agent-c/
+├── README.md               # Данное руководство
+├── TESTNOTES.md            # Заметки по тестированию
+├── agent/
+│   ├── src/
+│   │   └── trace_agent.c   # Финальный исходный код Си-агента
+│   └── libtrace_agent.jnilib # Собранная библиотека (macOS)
+├── test-app/
+│   ├── run_bench.sh        # Скрипт сборки и запуска бенчмарка
+│   ├── src/                # Исходный код Java-теста Фибоначчи
+│   └── trace_output.log    # Лог-файл с сырыми трейсами [TRACE]
+└── tracing-analyzer/       # Анализатор трейсов (Java без внешних зависимостей)
+    ├── src/                # Исходный код утилит анализа
+    ├── reports/            # Результаты анализа (CSV для Excel, TXT)
+    ├── generate-mapping.sh # Шаг 1: Сборка карты классов из релиза
+    └── analyze-traces.sh   # Шаг 2: Маппинг трейсов на JAR-файлы
+```
+
+## Сборка (Building)
+
+Для сборки агента необходим установленный JDK (переменная `$JAVA_HOME`) и компилятор (`clang` или `gcc`).
 
 ### macOS
-
 ```bash
-clang -shared -fPIC -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" -o libtrace_agent.jnilib trace_agent.c
+clang -O3 -shared -fPIC \
+  -I"$JAVA_HOME/include" \
+  -I"$JAVA_HOME/include/darwin" \
+  -o agent/libtrace_agent.jnilib agent/src/trace_agent.c
 ```
-
-Output: `libtrace_agent.jnilib`
 
 ### Linux
-
 ```bash
-gcc -shared -fPIC -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" -o libtrace_agent.so trace_agent.c
+gcc -O3 -shared -fPIC \
+  -I"$JAVA_HOME/include" \
+  -I"$JAVA_HOME/include/linux" \
+  -o agent/libtrace_agent.so agent/src/trace_agent.c
 ```
-
-Output: `libtrace_agent.so`
 
 ### Windows (MinGW)
-
 ```bash
-gcc -shared -fPIC -I"%JAVA_HOME%\include" -I"%JAVA_HOME%\include\win32" -o trace_agent.dll trace_agent.c
+gcc -O3 -shared -fPIC \
+  -I"%JAVA_HOME%\include" \
+  -I"%JAVA_HOME%\include\win32" \
+  -o agent/trace_agent.dll agent/src/trace_agent.c
 ```
+*Примечание: Флаг `-O3` рекомендуется для максимальной оптимизации атомарных операций процессора.*
 
-Output: `trace_agent.dll`
+## Использование (Usage)
 
-## Usage
-
-### Static Attach (Recommended)
-
+### Статическое подключение при старте JVM
+Перенаправьте `stdout` процесса, чтобы сохранить сырой поток трейсов в файл для последующего анализа:
 ```bash
-java -cp <your-classpath> -agentpath:path/to/libtrace_agent.jnilib <YourMainClass>
+java -agentpath:agent/libtrace_agent.jnilib -cp test-app/bin ru.sbrf.kafka.benchmark.BenchmarkApp > test-app/trace_output.log
 ```
 
-### Example
-
-```bash
-java -cp src/main/java -agentpath:libtrace_agent.jnilib Main2
+### Пример вывода статистики при закрытии (VMDeath)
+При выходе из Java-процесса в поток ошибок `stderr` (консоль Gradle/терминал) будет выведен диагностический лог:
+```text
+=== [TRACE AGENT STATISTICS] ===
+Размер массива кэша (CACHE_SIZE): 1048576
+Всего уникальных методов в кэше: 1541
+Занятых ячеек массива (Buckets): 1541
+Максимальная длина цепочки коллизий: 1
+Коэффициент заполнения (Load Factor): 0.0015
+================================
 ```
 
-### Output
+## Фильтрация пакетов (Blacklist)
 
-```
-[TRACE_AGENT] Loaded and enabled
-[INFO] can_generate_method_entry_events = 1
-Hello from hello()
-[TRACE] LMain2;.hello()V
-Hello from hello()
-[TRACE] LMain2;.hello()V
-Hello from hello()
-```
-
-## Controlling Tracing
-
-Use `AgentCommand.startTrace()` and `AgentCommand.endTrace()` to control when tracing is active:
-
-```java
-public class Main2 {
-    public static void main(String[] args) {
-        hello();                          // Not traced (tracing disabled)
-        AgentCommand.startTrace();
-        hello();                          // Traced
-        AgentCommand.endTrace();
-        hello();                          // Not traced (tracing disabled)
-    }
-    
-    static void hello() {
-        System.out.println("Hello from hello()");
-    }
-}
-```
-
-The agent looks for calls to `ru/sbrf/AgentCommand.startTrace()` and `ru/sbrf/AgentCommand.endTrace()` to toggle the trace flag.
-
-## Method Signature Format
-
-The agent prints method signatures in JVM descriptor format:
-
-- `LClassName;.methodName()V` - no parameters, returns void
-- `LClassName;.methodName(Ljava/lang/String;)V` - one String parameter, returns void
-- `LClassName;.methodName(I)Ljava/lang/String;` - one int parameter, returns String
-- `LClassName;.methodName(Ljava/util/List;Ljava/lang/Object;)Z` - List and Object parameters, returns boolean
-
-See [Java Type Signatures](https://docs.oracle.com/javase/specs/jvms/se17/html/jvms-4.html#jvms-4.3) for the full format.
-
-## Package Filtering
-
-Edit `WHITELIST_PREFIXES` and `BLACKLIST_PREFIXES` in `trace_agent.c` to customize which packages are traced:
+Агент работает по принципу блэклиста. По умолчанию логируются все методы приложения, кроме системного шума. Настройка исключений производится в массиве `BLACKLIST_PREFIXES` внутри `trace_agent.c`:
 
 ```c
-// Whitelist: only trace these packages (uncomment/add as needed)
-static const char* WHITELIST_PREFIXES[] = {
-    "net/jpountz/",
-    "com/azure/",
-    "com/fasterxml/jackson/",
-    "org/apache/commons/text/",
-    "org/springframework",
-    // Add your packages here
-};
-
-// Blacklist: never trace these packages
 static const char* BLACKLIST_PREFIXES[] = {
     "java/",
     "javax/",
@@ -120,71 +94,59 @@ static const char* BLACKLIST_PREFIXES[] = {
     "com/oracle/",
     "apple/",
     "org/gradle",
+    "worker/org/gradle",
+    "com/esotericsoftware/kryo/io/",
+    "com/code_intelligence/jazzer/"
 };
 ```
+*Важно: Префиксы путей указываются во внутреннем формате JVM с разделителем `/`, а не через точку.*
 
-**Note:** Use `/` separators (JVM internal format), not `.`. The whitelist is currently commented out; the agent uses blacklist mode by default (traces everything except blacklisted packages).
+---
 
-## Architecture
+## Анализ результатов (Tracing Analyzer)
 
-The agent uses:
-- **JVMTI (Java Virtual Machine Tool Interface)** to intercept method entry events
-- **MethodEntry callback** to capture every method invocation
-- **Capability negotiation** to request `can_generate_method_entry_events`
-- **Thread-local state** via JVMTI for tracing enable/disable flag
-- **Memory management** via JVMTI allocation/deallocation for strings
+В папке `tracing-analyzer` находятся утилиты, написанные на чистой Java. Они работают без систем сборки (Maven/Gradle) и внешних зависимостей. Запускаются на любой Java 11+ напрямую в памяти.
 
-### Entry Points
+Утилиты решают проблему идентификации JAR-файлов: они сопоставляют сырой лог `[TRACE]` с классами и методами конкретных библиотек и генерируют отчеты, оптимизированные для Microsoft Excel.
 
-- `Agent_OnLoad()` - Called when agent is loaded via `-agentpath` (static attach)
-- `Agent_OnAttach()` - Called when agent is loaded dynamically via `jcmd ... JVMTI.agent_load`
-- `Agent_OnUnload()` - Called when agent is unloaded
+### Шаг 1: Генерация маппинга классов релиза
+Скрипт автоматически обратится к собранному дистрибутиву в соседнем проекте (`../../corax/build/distributions/kafka-dist.zip`). Запустите его из папки анализатора:
+```bash
+cd tracing-analyzer
+./generate-mapping.sh
+```
+Скрипт распакует архив во временную директорию, рекурсивно обойдет все JAR-файлы (включая Fat JAR) и сформирует отсортированную карту классов `reports/class_jar_mapping.csv`.
+*Если один и тот же класс будет найден в разных JAR-файлах, утилита выбросит `IllegalStateException`.*
 
-### Callback Flow
+### Шаг 2: Анализ логов трейсинга
+Скрипт автоматически заберет файл `trace_output.log` из папки `test-app`, очистит сигнатуры от рантайм-лямбд, сопоставит их с картой классов и сгенерирует два отчета в папке `reports/`:
+```bash
+./analyze-traces.sh
+```
 
-1. JVM invokes `cbMethodEntry()` on every method entry
-2. Agent retrieves method name, signature, and declaring class via JVMTI
-3. Agent checks whitelist/blacklist filters in `should_trace()`
-4. Agent checks for `startTrace()`/`endTrace()` calls to toggle tracing
-5. If tracing is enabled and class passes filters, prints `[TRACE]` line
-6. JVMTI-allocated memory is deallocated before callback returns
+### Выходные файлы отчетов (`reports/`):
+1. **`matched_methods.csv`** — Список уникальных вызванных методов, сопоставленных с конкретными JAR-файлами. Текст первой колонки экранирован двойными кавычками (`"..."`), благодаря чему **Excel корректно открывает файл** и не разбивает строки по точкам с запятой внутри сигнатур методов (например, `"(Lcom/package/Class;)V"` останется в одной ячейке).
+2. **`matched_jars.txt`** — Список только тех уникальных JAR-файлов, методы из которых были реально вызваны и зафиксированы агентом (отсортирован по алфавиту).
 
-## Files
+---
 
-- `trace_agent.c` - Main agent implementation with JVMTI callbacks
-- `README.txt` - Basic readme (Russian)
-- `README.md` - This comprehensive readme
+## Сравнение производительности с Java-агентами
 
-## Comparison with Java Agent
+| Критерий | Java Agent (ASM/Bytecode) | Настоящий C Agent (Lock-Free) |
+| :--- | :--- | :--- |
+| **Метод перехвата** | Модификация байт-кода классов | Нативные колбэки JVMTI `MethodEntry` |
+| **Потокобезопасность** | Тяжелые синхронизации (`synchronized`) | Lock-Free чтение на атомиках C11 |
+| **Влияние коллизий** | Зависит от структуры HashMap | Изолировано в цепочках (длина 1 на быстром пути) |
+| **Память на метод** | Высокая (хранение строк/объектов Java) | Строго 16 байт (`MethodNode`) в нативной куче |
+| **Эффект наблюдателя** | Искажает тайминги выполнения потоков | Минимальный оверхед, сохраняет race conditions тестов |
 
-| Feature | Java Agent | C Agent |
-|---------|-----------|---------|
-| **Instrumentation** | ASM bytecode weaving | JVMTI method entry events |
-| **Build Output** | Fat JAR with ASM bundled | Native shared library |
-| **Performance** | Moderate (bytecode modification) | Lower overhead (native callbacks) |
-| **Portability** | Platform-independent JAR | Platform-specific binary |
-| **Filtering** | Package exclusion only | Whitelist + blacklist modes |
-| **Dynamic Attach** | No | Yes (via `Agent_OnAttach`) |
+## Устранение неполадок (Troubleshooting)
 
-## Troubleshooting
+### Ошибка: `address argument to atomic operation must be a pointer to _Atomic type`
+Если вы собираете старую версию кода на macOS через строгий Clang, обновите исходный код до актуального. В текущей версии поля структуры и массив изначально объявлены как `_Atomic(struct MethodNode*)`, что полностью совместимо со стандартом C11 в Xcode Default Toolchain.
 
-### "Unable to create JVMTI env"
+### Зависание (Deadlock) Java-процесса
+Если процесс намертво зависает, убедитесь, что в коде `trace_agent.c` медленный путь защищен с помощью `SetEventNotificationMode(..., JVMTI_DISABLE, ..., thread)`. В текущей реализации эта защита установлена и предотвращает повторный вход потока в мьютекс во время выполнения `fprintf`.
 
-Ensure `JAVA_HOME` is set correctly and points to a valid JDK installation (not just JRE).
-
-### No trace output
-
-1. Verify the agent loaded: look for `[TRACE_AGENT] Loaded and enabled`
-2. Check if tracing is disabled by default (calls to `startTrace()` may be needed)
-3. Verify your classes are not in the blacklist
-
-### Build fails with missing headers
-
-Ensure you're using the correct include paths for your platform:
-- macOS: `-I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin"`
-- Linux: `-I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux"`
-- Windows: `-I"%JAVA_HOME%\include" -I"%JAVA_HOME%\include\win32"`
-
-## License
-
-Same license as the Java agent project.
+### В логе trace_output.log мало строк при большом кэше
+Это нормальное поведение. Статистика в конце процесса показывает общее число уникальных методов, которые задействовала JVM (включая Gradle-воркеры и библиотеки тестов). Если в логе всего несколько строк, значит, блэклист успешно отфильтровал тысячи системных методов, оставив только чистый код вашего приложения.

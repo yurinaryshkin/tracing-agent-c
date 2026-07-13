@@ -1,0 +1,20 @@
+# Скомпилированные нативные библиотеки агента
+*.so
+*.dylib
+*.dll
+*.jnilib
+agent/libtrace_agent.jnilib
+
+# Директории сборки Java-приложения
+**/target/
+**/bin/
+
+# Логи бенчмарков и трейсинга
+*.log
+**/trace_output.log
+
+# Настройки сред разработки (JetBrains Idea, GigaIDE и др.)
+.idea/
+.gigaide/
+*.iml
+.DS_Store
